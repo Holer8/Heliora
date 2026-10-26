@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { createRecord, fetchRecords } from '@/services/api.service';
 import DiagnosisCodeInput from './DiagnosisCodeInput';
@@ -10,6 +10,13 @@ import { STELLAR_CONFIG } from '@/lib/stellar';
 import { TransactionBuilder, Networks, Operation, Asset, Memo } from '@stellar/stellar-sdk';
 import type { DiagnosisCode, MedicationCheckResult } from '@/types';
 import { AlertTriangle, AlertOctagon, ShieldAlert, Info } from 'lucide-react';
+import {
+  enqueueClinicalRecord,
+  listClinicalOutbox,
+  removeClinicalOutboxItem,
+  setClinicalOutboxStatus,
+  type ClinicalOutboxItem,
+} from '@/lib/clinicalOutbox';
 
 interface Props {
   patientAddress: string;
@@ -31,6 +38,83 @@ export default function NewRecordForm({ patientAddress, onSuccess, patientAllerg
 
   const [checkResult, setCheckResult] = useState<MedicationCheckResult | null>(null);
   const [isChecking, setIsChecking] = useState(false);
+  const [outbox, setOutbox] = useState<ClinicalOutboxItem[]>([]);
+  const [outboxOpen, setOutboxOpen] = useState(false);
+  const [isSyncingOutbox, setIsSyncingOutbox] = useState(false);
+  const syncingOutboxRef = useRef(false);
+
+  const refreshOutbox = useCallback(async () => {
+    if (!publicKey) return;
+    try {
+      setOutbox(await listClinicalOutbox(publicKey));
+    } catch {
+      // Keep the form usable if local storage is unavailable; queueing reports its own error.
+    }
+  }, [publicKey]);
+
+  const syncOutbox = useCallback(async () => {
+    if (!publicKey || !navigator.onLine || syncingOutboxRef.current) return;
+    syncingOutboxRef.current = true;
+    setIsSyncingOutbox(true);
+    try {
+      const pending = (await listClinicalOutbox(publicKey)).filter(
+        (item) => item.status !== 'synced',
+      );
+      for (const item of pending) {
+        await setClinicalOutboxStatus(item.id, 'syncing');
+        await refreshOutbox();
+        try {
+          await createRecord(item.payload);
+          await setClinicalOutboxStatus(item.id, 'synced');
+          void queryClient.invalidateQueries({ queryKey: ['doctor-appointments'] });
+          void queryClient.invalidateQueries({
+            queryKey: ['patient-records', item.payload.patientAddress],
+          });
+        } catch {
+          await setClinicalOutboxStatus(item.id, 'pending');
+          break;
+        }
+      }
+      await refreshOutbox();
+    } finally {
+      syncingOutboxRef.current = false;
+      setIsSyncingOutbox(false);
+    }
+  }, [publicKey, queryClient, refreshOutbox]);
+
+  useEffect(() => {
+    void refreshOutbox();
+    if (navigator.onLine) void syncOutbox();
+    const handleOnline = () => {
+      void syncOutbox();
+    };
+    const handleWorkerMessage = (event: MessageEvent) => {
+      if (event.data?.type === 'heliora-sync-outbox') void syncOutbox();
+    };
+    window.addEventListener('online', handleOnline);
+    navigator.serviceWorker?.addEventListener('message', handleWorkerMessage);
+    if ('serviceWorker' in navigator) {
+      void navigator.serviceWorker
+        .register('/service-worker.js')
+        .then(async (registration) => {
+          const syncRegistration = registration as ServiceWorkerRegistration & {
+            sync?: { register: (tag: string) => Promise<void> };
+          };
+          try {
+            await syncRegistration.sync?.register('heliora-clinical-outbox');
+          } catch {
+            /* online event remains available */
+          }
+        })
+        .catch(() => {
+          /* unsupported or blocked; online event remains available */
+        });
+    }
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      navigator.serviceWorker?.removeEventListener('message', handleWorkerMessage);
+    };
+  }, [refreshOutbox, syncOutbox]);
 
   // Fetch patient medical records to extract active medications & allergies
   const { data: patientRecords } = useQuery({
@@ -121,7 +205,7 @@ export default function NewRecordForm({ patientAddress, onSuccess, patientAllerg
           ? `${form.notes ? form.notes + '\n\n' : ''}[PHYSICIAN CLINICAL OVERRIDE RATIONALE]: ${form.overrideRationale.trim()}`
           : form.notes;
 
-      const record = await createRecord({
+      const payload = {
         patientAddress,
         diagnosis: form.diagnosis,
         prescription: form.prescription,
@@ -130,7 +214,27 @@ export default function NewRecordForm({ patientAddress, onSuccess, patientAllerg
           ? { overrideRationale: form.overrideRationale.trim() }
           : {}),
         ...(dx ? { diagnosisCode: dx } : {}),
-      });
+      };
+
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        if (!publicKey)
+          throw new Error('Connect the clinician wallet to securely queue this note.');
+        await enqueueClinicalRecord(publicKey, payload);
+        try {
+          const registration = await navigator.serviceWorker?.ready;
+          const syncRegistration = registration as
+            | (ServiceWorkerRegistration & {
+                sync?: { register: (tag: string) => Promise<void> };
+              })
+            | undefined;
+          await syncRegistration?.sync?.register('heliora-clinical-outbox');
+        } catch {
+          /* The online event still syncs the queue when the app is open. */
+        }
+        return { queuedOffline: true as const };
+      }
+
+      const record = await createRecord(payload);
 
       // Build a minimal Stellar tx as on-chain proof
       if (window.freighter && publicKey) {
@@ -169,11 +273,13 @@ export default function NewRecordForm({ patientAddress, onSuccess, patientAllerg
         );
       }
 
-      return record;
+      return { queuedOffline: false as const, record };
     },
-    onSuccess: () => {
+    onSuccess: (result) => {
       void queryClient.invalidateQueries({ queryKey: ['doctor-appointments'] });
       void queryClient.invalidateQueries({ queryKey: ['patient-records', patientAddress] });
+      void refreshOutbox();
+      if (result.queuedOffline) setOutboxOpen(true);
       setForm({
         diagnosis: '',
         prescription: '',
@@ -183,7 +289,7 @@ export default function NewRecordForm({ patientAddress, onSuccess, patientAllerg
       });
       setDx(null);
       setCheckResult(null);
-      onSuccess();
+      if (!result.queuedOffline) onSuccess();
     },
   });
 
@@ -215,6 +321,88 @@ export default function NewRecordForm({ patientAddress, onSuccess, patientAllerg
           className="mt-2 w-full rounded-md border border-border px-3 py-2 text-sm bg-surface-inset text-text-1 focus:outline-none focus:ring-2 focus:ring-border-focus"
         />
       </div>
+
+      <div className="flex justify-end">
+        <button
+          type="button"
+          onClick={() => {
+            void refreshOutbox();
+            setOutboxOpen(true);
+          }}
+          className="text-xs text-text-2 underline"
+        >
+          Clinical outbox ({outbox.filter((item) => item.status !== 'synced').length} pending)
+        </button>
+      </div>
+
+      {outboxOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="clinical-outbox-title"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+        >
+          <section className="w-full max-w-lg rounded-lg bg-surface-card p-5 shadow-xl">
+            <div className="mb-4 flex items-center justify-between">
+              <h2 id="clinical-outbox-title" className="text-base font-semibold">
+                Clinical outbox
+              </h2>
+              <button
+                type="button"
+                onClick={() => setOutboxOpen(false)}
+                aria-label="Close outbox"
+                className="text-sm"
+              >
+                Close
+              </button>
+            </div>
+            {outbox.length === 0 ? (
+              <p className="text-sm text-text-2">No queued clinical notes.</p>
+            ) : (
+              <ul className="max-h-72 space-y-3 overflow-y-auto">
+                {outbox.map((item) => (
+                  <li
+                    key={item.id}
+                    className="flex items-center justify-between gap-3 rounded border border-border p-3"
+                  >
+                    <div>
+                      <p className="text-sm font-medium">{item.payload.diagnosis}</p>
+                      <p className="text-xs text-text-2">
+                        {new Date(item.createdAt).toLocaleString()}
+                      </p>
+                    </div>
+                    <span className="text-xs capitalize">{item.status}</span>
+                    {item.status === 'synced' && (
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          await removeClinicalOutboxItem(item.id);
+                          await refreshOutbox();
+                        }}
+                        className="text-xs underline"
+                      >
+                        Dismiss
+                      </button>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+            <div className="mt-4 flex justify-end">
+              <button
+                type="button"
+                disabled={!navigator.onLine || isSyncingOutbox}
+                onClick={() => {
+                  void syncOutbox();
+                }}
+                className="rounded bg-green px-3 py-2 text-sm font-medium disabled:opacity-50"
+              >
+                {isSyncingOutbox ? 'Syncing…' : 'Sync now'}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
 
       <div>
         <div className="flex items-center justify-between mb-1">
